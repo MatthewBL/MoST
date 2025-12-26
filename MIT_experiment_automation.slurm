@@ -7,4 +7,4 @@ pip install -r requirements.txt
 
 # Run your experiment
 echo "Start experiment"
-python -u experiment_automation.py
+python -u MIT_experiment.py
