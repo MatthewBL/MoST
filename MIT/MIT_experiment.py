@@ -176,7 +176,7 @@ def run_simple_experiments() -> dict:
 
         req_min = 1
         iterations = 0
-        parent_dir = "MIT" + f"{input_tokens}_{output_tokens}"
+        parent_dir = f"{input_tokens}_{output_tokens}"
         while True:
             iterations += 1
             print(f"\n--- Iteration {iterations}: REQ_MIN={req_min}, INPUT={input_tokens}, OUTPUT={output_tokens} ---")
