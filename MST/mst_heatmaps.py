@@ -9,6 +9,7 @@ import numpy as np
 import csv
 import matplotlib.pyplot as plt
 import seaborn as sns
+import json
 
 # -----------------------------
 # Configuration
@@ -17,8 +18,21 @@ RUN_DIR_PATTERN = re.compile(r"^requests_deepseek_\d+$")
 TOKEN_DIR_PATTERN = re.compile(r"^(\d+)_(\d+)$")
 TIMESTAMP_DIR_PATTERN = re.compile(r"^(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})$")
 RESULTS_FILE = "results.csv"
+RESULTS_JSON_FILE = "results.json"
 FIRST_HALF_FILE = "first_half.csv"
 SECOND_HALF_FILE = "second_half.csv"
+
+# Mapping from group folder names to friendly titles for heatmap headers
+GROUP_TITLE_MAP: Dict[str, str] = {
+    "a40": "Deepseek 7B - A40",
+    "a40-2": "Llama 8B - A40",
+    "a40-3": "Gemma 7B - A40",
+    "a100": "Deepseek 7B - A100",
+    "a100-2": "Llama 8B - A100",
+}
+
+def group_title(name: str) -> str:
+    return GROUP_TITLE_MAP.get(name, name)
 
 # -----------------------------
 # Helpers
@@ -41,17 +55,17 @@ def parse_timestamp_dir(name: str) -> Optional[datetime]:
         return None
 
 
-def read_result_csv(csv_path: Path) -> Optional[Tuple[bool, float]]:
+def read_result(ts_dir: Path) -> Optional[Tuple[bool, float]]:
     """
-    Read a results.csv and return (evaluation_bool, req_min_float) for that attempt.
-    Returns None if file unreadable or missing required columns.
+    Read attempt result from results.json (preferred) or results.csv in ts_dir.
+    Return (evaluation_bool, req_min_float) or None if unavailable.
     """
+    csv_path = ts_dir / RESULTS_FILE
     if not csv_path.exists():
         return None
     try:
         with csv_path.open(newline='', encoding='utf-8') as f:
             reader = csv.DictReader(f)
-            # Expect a single row
             for row in reader:
                 eval_val = row.get("EVALUATION")
                 if eval_val is None:
@@ -98,7 +112,7 @@ def collect_mst_for_run(run_root: Path) -> Dict[Tuple[int, int], float]:
         timestamp_dirs.sort(key=lambda x: x[0])
         last_true_reqmin: Optional[float] = None
         for _, ts_path in timestamp_dirs:
-            result = read_result_csv(ts_path / RESULTS_FILE)
+            result = read_result(ts_path)
             if not result:
                 continue
             evaluation, req_min = result
@@ -139,7 +153,7 @@ def collect_mst_iteration_dirs_for_run(run_root: Path) -> Dict[Tuple[int, int], 
 
         last_true_path: Optional[Path] = None
         for _, ts_path in timestamp_dirs:
-            result = read_result_csv(ts_path / RESULTS_FILE)
+            result = read_result(ts_path)
             if not result:
                 continue
             evaluation, _ = result
@@ -150,6 +164,62 @@ def collect_mst_iteration_dirs_for_run(run_root: Path) -> Dict[Tuple[int, int], 
             chosen[(in_tok, out_tok)] = last_true_path
 
     return chosen
+
+
+def discover_run_dirs(data_base: Path) -> List[Path]:
+    """
+    Recursively discover run directories matching RUN_DIR_PATTERN under data_base.
+    This adapts to current project layouts like data/a40/requests/... or deeper.
+    """
+    candidates: List[Path] = []
+    try:
+        # Primary: explicit run dir names
+        for p in data_base.rglob("*"):
+            if not p.is_dir():
+                continue
+            if RUN_DIR_PATTERN.match(p.name):
+                candidates.append(p)
+        # Fallback: any directory containing token pair subdirectories (e.g., 128_256)
+        for p in data_base.rglob("*"):
+            if not p.is_dir():
+                continue
+            try:
+                has_token = any((c.is_dir() and parse_token_dir(c.name) is not None) for c in p.iterdir())
+            except Exception:
+                has_token = False
+            if has_token:
+                candidates.append(p)
+    except Exception:
+        pass
+    # Sort by path name for stable ordering
+    # Deduplicate while preserving order
+    seen = set()
+    ordered: List[Path] = []
+    for p in sorted(candidates, key=lambda x: x.as_posix()):
+        if p.as_posix() in seen:
+            continue
+        seen.add(p.as_posix())
+        ordered.append(p)
+    return ordered
+
+
+def group_run_roots_by_top_level(run_roots: List[Path], data_base: Path) -> Dict[str, List[Path]]:
+    """
+    Group run roots by the top-level folder directly under data_base
+    (e.g., a40, a40-2, a40-3, a100, a100-2), regardless of the depth of the
+    discovered run root. This avoids grouping under 'data' when the run root
+    itself is the first-level directory.
+    """
+    groups: Dict[str, List[Path]] = {}
+    for rr in run_roots:
+        try:
+            rel = rr.relative_to(data_base)
+            grp = rel.parts[0] if rel.parts else rr.name
+        except Exception:
+            # Fallback: use immediate parent name
+            grp = rr.parent.name
+        groups.setdefault(grp, []).append(rr)
+    return groups
 
 
 def build_matrix(mst_map: Dict[Tuple[int, int], float]) -> Tuple[np.ndarray, List[int], List[int]]:
@@ -458,7 +528,7 @@ def collect_spike_minutes_for_run(run_root: Path, spike_factor: float, spike_mad
                 continue
             if parse_timestamp_dir(ts_dir.name) is None:
                 continue
-            rr = read_result_csv(ts_dir / RESULTS_FILE)
+            rr = read_result(ts_dir)
             if not rr:
                 continue
             evaluation, req_min = rr
@@ -539,91 +609,100 @@ def main(
         return
     plots_base.mkdir(parents=True, exist_ok=True)
 
-    # Find run roots matching pattern requests_deepseek_* inside data dir
-    run_roots: List[Path] = [
-        p for p in data_base.iterdir()
-        if p.is_dir() and RUN_DIR_PATTERN.match(p.name)
-    ]
+    # Find run roots recursively under data dir
+    run_roots: List[Path] = discover_run_dirs(data_base)
 
     if not run_roots:
         print("No run directories matching 'requests_deepseek_*' found.")
         return
 
-    print(f"Found runs in {data_base}: {[p.name for p in run_roots]}")
+    # Group run roots by the top-level folder under data_base (e.g., a40, a40-2, a100, ...)
+    groups: Dict[str, List[Path]] = group_run_roots_by_top_level(run_roots, data_base)
 
-    # Collect MSTs per run
-    per_run_mst: Dict[str, Dict[Tuple[int, int], float]] = {}
-    for run_root in sorted(run_roots, key=lambda p: p.name):
-        print(f"Processing {run_root.name} ...")
-        mst_map = collect_mst_for_run(run_root)
-        per_run_mst[run_root.name] = mst_map
+    print(f"Found groups under {data_base}: {sorted(groups.keys())}")
 
-        # Save per-run CSV (to plots)
-        if mst_map:
-            df_out = plots_base / f"mst_{run_root.name}.csv"
-            with df_out.open('w', newline='', encoding='utf-8') as f:
+    # Process each group independently, writing outputs into plots/<group>
+    for group_name, group_runs in sorted(groups.items(), key=lambda x: x[0]):
+        group_plots = plots_base / group_name
+        group_plots.mkdir(parents=True, exist_ok=True)
+
+        try:
+            rel_names = [p.relative_to(data_base).as_posix() for p in group_runs]
+        except Exception:
+            rel_names = [p.as_posix() for p in group_runs]
+        print(f"Processing group '{group_name}': {rel_names}")
+
+        # Collect MSTs per run within group
+        per_run_mst: Dict[str, Dict[Tuple[int, int], float]] = {}
+        for run_root in sorted(group_runs, key=lambda p: p.as_posix()):
+            run_id = run_root.relative_to(data_base).as_posix()
+            print(f"  Processing {run_id} ...")
+            mst_map = collect_mst_for_run(run_root)
+            per_run_mst[run_id] = mst_map
+
+            # Save per-run CSV (to group plots)
+            if mst_map:
+                df_out = group_plots / f"mst_{run_root.name}.csv"
+                with df_out.open('w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["input_tokens", "output_tokens", "mst_req_min"])
+                    for (inp, outp), val in sorted(mst_map.items()):
+                        writer.writerow([inp, outp, val])
+
+            # Plot per-run heatmap
+            matrix, inputs, outputs = build_matrix(mst_map)
+            plot_heatmap(
+                matrix,
+                inputs,
+                outputs,
+                title=f"MST Heatmap - {run_root.name}",
+                out_path=group_plots / f"mst_heatmap_{run_root.name}.png",
+            )
+
+        # Build average across runs for this group
+        all_pairs = set()
+        for m in per_run_mst.values():
+            all_pairs.update(m.keys())
+
+        if all_pairs:
+            avg_map: Dict[Tuple[int, int], float] = {}
+            for pair in sorted(all_pairs):
+                vals = [m[pair] for m in per_run_mst.values() if pair in m]
+                if vals:
+                    avg_map[pair] = float(np.mean(vals))
+
+            # Save average CSV
+            avg_out = group_plots / "mst_average.csv"
+            with avg_out.open('w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                writer.writerow(["input_tokens", "output_tokens", "mst_req_min"])
-                for (inp, outp), val in sorted(mst_map.items()):
+                writer.writerow(["input_tokens", "output_tokens", "avg_mst_req_min"])
+                for (inp, outp), val in sorted(avg_map.items()):
                     writer.writerow([inp, outp, val])
 
-        # Plot per-run heatmap
-        matrix, inputs, outputs = build_matrix(mst_map)
-        plot_heatmap(
-            matrix,
-            inputs,
-            outputs,
-            title=f"MST Heatmap - {run_root.name}",
-            out_path=plots_base / f"mst_heatmap_{run_root.name}.png",
+            # Plot average heatmap
+            matrix, inputs, outputs = build_matrix(avg_map)
+            plot_heatmap(
+                matrix,
+                inputs,
+                outputs,
+                title=f"MST Heatmap - Average Across Runs ({group_title(group_name)})",
+                out_path=group_plots / "mst_heatmap_average.png",
+            )
+        else:
+            print(f"  No MST data found to compute average for group '{group_name}'.")
+
+        # Detect outliers across runs (within group) and plot cleaned heatmaps
+        flagged = compute_outlier_flags(
+            per_run_mst,
+            method=method,
+            z_thresh=z_thresh,
+            iqr_k=iqr_k,
+            ratio_upper=ratio_upper,
+            ratio_lower=ratio_lower,
+            log_space=log_space,
+            min_runs=min_runs,
+            report_path=group_plots / "mst_outliers_report.csv",
         )
-
-    # Build average across runs
-    # Collect all token pairs observed across runs
-    all_pairs = set()
-    for m in per_run_mst.values():
-        all_pairs.update(m.keys())
-
-    if not all_pairs:
-        print("No MST data found to compute average.")
-        return
-
-    # For each pair, average across runs (ignore missing)
-    avg_map: Dict[Tuple[int, int], float] = {}
-    for pair in sorted(all_pairs):
-        vals = [m[pair] for m in per_run_mst.values() if pair in m]
-        if vals:
-            avg_map[pair] = float(np.mean(vals))
-
-    # Save average CSV
-    avg_out = plots_base / "mst_average.csv"
-    with avg_out.open('w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(["input_tokens", "output_tokens", "avg_mst_req_min"])
-        for (inp, outp), val in sorted(avg_map.items()):
-            writer.writerow([inp, outp, val])
-
-    # Plot average heatmap
-    matrix, inputs, outputs = build_matrix(avg_map)
-    plot_heatmap(
-        matrix,
-        inputs,
-        outputs,
-        title="MST Heatmap - Average Across Runs",
-        out_path=plots_base / "mst_heatmap_average.png",
-    )
-
-    # Detect outliers across runs and plot cleaned heatmaps
-    flagged = compute_outlier_flags(
-        per_run_mst,
-        method=method,
-        z_thresh=z_thresh,
-        iqr_k=iqr_k,
-        ratio_upper=ratio_upper,
-        ratio_lower=ratio_lower,
-        log_space=log_space,
-        min_runs=min_runs,
-        report_path=plots_base / "mst_outliers_report.csv",
-    )
 
     # Manual overrides
     # These are passed via global args parsed in __main__; to keep main() pure and testable,
@@ -680,264 +759,278 @@ def main(
                 if drop_above_val is not None and v > drop_above_val:
                     flagged.add((run_name, pair))
 
-    # Per-run cleaned heatmaps (mask flagged values)
-    for run_root in sorted(run_roots, key=lambda p: p.name):
-        run_name = run_root.name
-        orig_map = per_run_mst.get(run_name, {})
-        clean_map = {pair: v for pair, v in orig_map.items() if (run_name, pair) not in flagged}
-        matrix_c, inputs_c, outputs_c = build_matrix(clean_map)
-        plot_heatmap(
-            matrix_c,
-            inputs_c,
-            outputs_c,
-            title=f"MST Heatmap - {run_name} (clean)",
-            out_path=plots_base / f"mst_heatmap_{run_name}_clean.png",
-        )
+        # Per-run cleaned heatmaps (mask flagged values)
+        for run_root in sorted(group_runs, key=lambda p: p.as_posix()):
+            run_id = run_root.relative_to(data_base).as_posix()
+            orig_map = per_run_mst.get(run_id, {})
+            clean_map = {pair: v for pair, v in orig_map.items() if (run_id, pair) not in flagged}
+            matrix_c, inputs_c, outputs_c = build_matrix(clean_map)
+            plot_heatmap(
+                matrix_c,
+                inputs_c,
+                outputs_c,
+                title=f"MST Heatmap - {run_root.name} (clean)",
+                out_path=group_plots / f"mst_heatmap_{run_root.name}_clean.png",
+            )
 
     # Cleaned average across runs (ignore missing; drop flagged or winsorize)
-    avg_map_clean: Dict[Tuple[int, int], float] = {}
-    for pair in sorted(all_pairs):
-        vals: List[float] = []
-        for run_name, m in per_run_mst.items():
-            if pair not in m:
-                continue
-            v = m[pair]
-            if (run_name, pair) in flagged:
-                if winsorize:
-                    vals.append(v)  # keep, will cap later
+        avg_map_clean: Dict[Tuple[int, int], float] = {}
+        for pair in sorted(all_pairs):
+            vals: List[float] = []
+            for run_name, m in per_run_mst.items():
+                if pair not in m:
+                    continue
+                v = m[pair]
+                if (run_name, pair) in flagged:
+                    if winsorize:
+                        vals.append(v)
+                    else:
+                        continue
                 else:
-                    continue  # drop outlier for clean average
-            else:
-                vals.append(v)
+                    vals.append(v)
 
-        if not vals:
-            continue
+            if not vals:
+                continue
 
-        if winsorize and len(vals) >= 3:
-            lo_q, hi_q = winsor_quantiles
-            lo, hi = np.quantile(vals, [lo_q, hi_q])
-            vals = [min(max(x, lo), hi) for x in vals]
+            if winsorize and len(vals) >= 3:
+                lo_q, hi_q = winsor_quantiles
+                lo, hi = np.quantile(vals, [lo_q, hi_q])
+                vals = [min(max(x, lo), hi) for x in vals]
 
-        avg_map_clean[pair] = float(np.mean(vals))
+            avg_map_clean[pair] = float(np.mean(vals))
 
-    matrix_ac, inputs_ac, outputs_ac = build_matrix(avg_map_clean)
-    plot_heatmap(
-        matrix_ac,
-        inputs_ac,
-        outputs_ac,
-        title="MST Heatmap - Average Across Runs (clean)",
-        out_path=plots_base / "mst_heatmap_average_clean.png",
-    )
+        matrix_ac, inputs_ac, outputs_ac = build_matrix(avg_map_clean)
+        plot_heatmap(
+            matrix_ac,
+            inputs_ac,
+            outputs_ac,
+            title=f"MST Heatmap - Average Across Runs (clean, {group_title(group_name)})",
+            out_path=group_plots / "mst_heatmap_average_clean.png",
+        )
 
     # Min and Max heatmaps across runs (raw)
-    min_map: Dict[Tuple[int, int], float] = {}
-    max_map: Dict[Tuple[int, int], float] = {}
-    for pair in sorted(all_pairs):
-        vals = [m[pair] for m in per_run_mst.values() if pair in m]
-        if vals:
-            min_map[pair] = float(np.min(vals))
-            max_map[pair] = float(np.max(vals))
+        min_map: Dict[Tuple[int, int], float] = {}
+        max_map: Dict[Tuple[int, int], float] = {}
+        for pair in sorted(all_pairs):
+            vals = [m[pair] for m in per_run_mst.values() if pair in m]
+            if vals:
+                min_map[pair] = float(np.min(vals))
+                max_map[pair] = float(np.max(vals))
 
-    matrix_min, inputs_min, outputs_min = build_matrix(min_map)
-    plot_heatmap(
-        matrix_min,
-        inputs_min,
-        outputs_min,
-        title="MST Heatmap - Min Across Runs",
-        out_path=plots_base / "mst_heatmap_min.png",
-    )
+        matrix_min, inputs_min, outputs_min = build_matrix(min_map)
+        plot_heatmap(
+            matrix_min,
+            inputs_min,
+            outputs_min,
+            title=f"MST Heatmap - Min Across Runs ({group_title(group_name)})",
+            out_path=group_plots / "mst_heatmap_min.png",
+        )
 
-    matrix_max, inputs_max, outputs_max = build_matrix(max_map)
-    plot_heatmap(
-        matrix_max,
-        inputs_max,
-        outputs_max,
-        title="MST Heatmap - Max Across Runs",
-        out_path=plots_base / "mst_heatmap_max.png",
-    )
+        matrix_max, inputs_max, outputs_max = build_matrix(max_map)
+        plot_heatmap(
+            matrix_max,
+            inputs_max,
+            outputs_max,
+            title=f"MST Heatmap - Max Across Runs ({group_title(group_name)})",
+            out_path=group_plots / "mst_heatmap_max.png",
+        )
 
     # Min and Max heatmaps across runs (clean: exclude flagged only)
-    min_map_clean: Dict[Tuple[int, int], float] = {}
-    max_map_clean: Dict[Tuple[int, int], float] = {}
-    for pair in sorted(all_pairs):
-        vals_clean = [m[pair] for run_name, m in per_run_mst.items() if pair in m and (run_name, pair) not in flagged]
-        if vals_clean:
-            min_map_clean[pair] = float(np.min(vals_clean))
-            max_map_clean[pair] = float(np.max(vals_clean))
+        min_map_clean: Dict[Tuple[int, int], float] = {}
+        max_map_clean: Dict[Tuple[int, int], float] = {}
+        for pair in sorted(all_pairs):
+            vals_clean = [m[pair] for run_name, m in per_run_mst.items() if pair in m and (run_name, pair) not in flagged]
+            if vals_clean:
+                min_map_clean[pair] = float(np.min(vals_clean))
+                max_map_clean[pair] = float(np.max(vals_clean))
 
-    matrix_min_c, inputs_min_c, outputs_min_c = build_matrix(min_map_clean)
-    plot_heatmap(
-        matrix_min_c,
-        inputs_min_c,
-        outputs_min_c,
-        title="MST Heatmap - Min Across Runs (clean)",
-        out_path=plots_base / "mst_heatmap_min_clean.png",
-    )
+        matrix_min_c, inputs_min_c, outputs_min_c = build_matrix(min_map_clean)
+        plot_heatmap(
+            matrix_min_c,
+            inputs_min_c,
+            outputs_min_c,
+            title=f"MST Heatmap - Min Across Runs (clean, {group_title(group_name)})",
+            out_path=group_plots / "mst_heatmap_min_clean.png",
+        )
 
-    matrix_max_c, inputs_max_c, outputs_max_c = build_matrix(max_map_clean)
-    plot_heatmap(
-        matrix_max_c,
-        inputs_max_c,
-        outputs_max_c,
-        title="MST Heatmap - Max Across Runs (clean)",
-        out_path=plots_base / "mst_heatmap_max_clean.png",
-    )
+        matrix_max_c, inputs_max_c, outputs_max_c = build_matrix(max_map_clean)
+        plot_heatmap(
+            matrix_max_c,
+            inputs_max_c,
+            outputs_max_c,
+            title=f"MST Heatmap - Max Across Runs (clean, {group_title(group_name)})",
+            out_path=group_plots / "mst_heatmap_max_clean.png",
+        )
 
-    print("Done. Generated raw and cleaned heatmaps, plus min/max across runs.")
+        print(f"Done group '{group_name}'. Generated raw and cleaned MST heatmaps, plus min/max across runs.")
+
+    return  # End of main()
 
     # -----------------------------------------------
     # Spike minute heatmaps (using failing iterations)
     # -----------------------------------------------
     print("Computing spike minute heatmaps (failing iterations)...")
-    per_run_spike: Dict[str, Dict[Tuple[int, int], int]] = {}
-    for run_root in sorted(run_roots, key=lambda p: p.name):
-        run_name = run_root.name
-        spikes_map = collect_spike_minutes_for_run(
-            run_root,
-            spike_factor=spike_factor,
-            spike_mad_k=spike_mad_k,
-            spike_min_obs=spike_min_obs,
-            spike_fallback=spike_fallback,
-        )
-        per_run_spike[run_name] = spikes_map
+    # Re-discover runs and groups (in case earlier scope variables changed)
+    run_roots = discover_run_dirs(data_base)
+    groups = group_run_roots_by_top_level(run_roots, data_base)
 
-        # Save per-run spikes CSV
-        if spikes_map:
-            out_csv = plots_base / f"spike_minutes_{run_name}.csv"
-            with out_csv.open('w', newline='', encoding='utf-8') as f:
-                w = csv.writer(f)
-                w.writerow(["input_tokens", "output_tokens", "spike_minute"])
-                for (inp, outp), minute in sorted(spikes_map.items()):
-                    w.writerow([inp, outp, minute])
+    for group_name, group_runs in sorted(groups.items(), key=lambda x: x[0]):
+        group_plots = plots_base / group_name
+        per_run_spike: Dict[str, Dict[Tuple[int, int], int]] = {}
+        flagged: set = set()
+        for run_root in sorted(group_runs, key=lambda p: p.as_posix()):
+            run_name = run_root.name
+            spikes_map = collect_spike_minutes_for_run(
+                run_root,
+                spike_factor=spike_factor,
+                spike_mad_k=spike_mad_k,
+                spike_min_obs=spike_min_obs,
+                spike_fallback=spike_fallback,
+            )
+            per_run_spike[run_name] = spikes_map
 
-        # Plot per-run spikes heatmap
-        smatrix, sinputs, soutputs = build_matrix({k: float(v) for k, v in spikes_map.items()})
-        plot_heatmap(
-            smatrix,
-            sinputs,
-            soutputs,
-            title=f"Spike Minute Heatmap - {run_name}",
-            out_path=plots_base / f"spike_heatmap_{run_name}.png",
-        )
+            # Save per-run spikes CSV
+            if spikes_map:
+                out_csv = group_plots / f"spike_minutes_{run_name}.csv"
+                with out_csv.open('w', newline='', encoding='utf-8') as f:
+                    w = csv.writer(f)
+                    w.writerow(["input_tokens", "output_tokens", "spike_minute"])
+                    for (inp, outp), minute in sorted(spikes_map.items()):
+                        w.writerow([inp, outp, minute])
 
-        # Plot per-run spikes heatmap (clean): exclude flagged (run, pair)
-        spikes_map_clean = {pair: v for pair, v in spikes_map.items() if (run_name, pair) not in flagged}
-        smatrix_c, sinputs_c, soutputs_c = build_matrix({k: float(v) for k, v in spikes_map_clean.items()})
-        plot_heatmap(
-            smatrix_c,
-            sinputs_c,
-            soutputs_c,
-            title=f"Spike Minute Heatmap - {run_name} (clean)",
-            out_path=plots_base / f"spike_heatmap_{run_name}_clean.png",
-        )
+            # Plot per-run spikes heatmap
+            smatrix, sinputs, soutputs = build_matrix({k: float(v) for k, v in spikes_map.items()})
+            plot_heatmap(
+                smatrix,
+                sinputs,
+                soutputs,
+                title=f"Spike Minute Heatmap - {run_name}",
+                out_path=group_plots / f"spike_heatmap_{run_name}.png",
+            )
 
-    # Average spike minute across runs (where available)
-    all_spike_pairs = set()
-    for m in per_run_spike.values():
-        all_spike_pairs.update(m.keys())
+            # Plot per-run spikes heatmap (clean): exclude flagged (run, pair)
+            spikes_map_clean = {pair: v for pair, v in spikes_map.items() if (run_name, pair) not in flagged}
+            smatrix_c, sinputs_c, soutputs_c = build_matrix({k: float(v) for k, v in spikes_map_clean.items()})
+            plot_heatmap(
+                smatrix_c,
+                sinputs_c,
+                soutputs_c,
+                title=f"Spike Minute Heatmap - {run_name} (clean)",
+                out_path=group_plots / f"spike_heatmap_{run_name}_clean.png",
+            )
+            # Average spike minute across runs (where available)
+        all_spike_pairs = set()
+        for m in per_run_spike.values():
+            all_spike_pairs.update(m.keys())
 
-    if all_spike_pairs:
-        avg_spike: Dict[Tuple[int, int], float] = {}
-        for pair in sorted(all_spike_pairs):
-            vals = [m[pair] for m in per_run_spike.values() if pair in m]
-            if vals:
-                avg_spike[pair] = float(np.mean(vals))
-        smatrix, sinputs, soutputs = build_matrix(avg_spike)
-        plot_heatmap(
-            smatrix,
-            sinputs,
-            soutputs,
-            title="Spike Minute Heatmap - Average Across Runs",
-            out_path=plots_base / "spike_heatmap_average.png",
-        )
+        if all_spike_pairs:
+            avg_spike: Dict[Tuple[int, int], float] = {}
+            for pair in sorted(all_spike_pairs):
+                vals = [m[pair] for m in per_run_spike.values() if pair in m]
+                if vals:
+                    avg_spike[pair] = float(np.mean(vals))
+            smatrix, sinputs, soutputs = build_matrix(avg_spike)
+            plot_heatmap(
+                smatrix,
+                sinputs,
+                soutputs,
+                title="Spike Minute Heatmap - Average Across Runs",
+                out_path=group_plots / "spike_heatmap_average.png",
+            )
 
-        # Clean average spike minutes (exclude flagged)
-        avg_spike_clean: Dict[Tuple[int, int], float] = {}
-        for pair in sorted(all_spike_pairs):
-            vals_c = [m[pair] for run_name, m in per_run_spike.items() if pair in m and (run_name, pair) not in flagged]
-            if vals_c:
-                avg_spike_clean[pair] = float(np.mean(vals_c))
-        smatrix_c, sinputs_c, soutputs_c = build_matrix(avg_spike_clean)
-        plot_heatmap(
-            smatrix_c,
-            sinputs_c,
-            soutputs_c,
-            title="Spike Minute Heatmap - Average Across Runs (clean)",
-            out_path=plots_base / "spike_heatmap_average_clean.png",
-        )
+            # Clean average spike minutes (exclude flagged)
+            avg_spike_clean: Dict[Tuple[int, int], float] = {}
+            for pair in sorted(all_spike_pairs):
+                vals_c = [m[pair] for run_name, m in per_run_spike.items() if pair in m and (run_name, pair) not in flagged]
+                if vals_c:
+                    avg_spike_clean[pair] = float(np.mean(vals_c))
+            smatrix_c, sinputs_c, soutputs_c = build_matrix(avg_spike_clean)
+            plot_heatmap(
+                smatrix_c,
+                sinputs_c,
+                soutputs_c,
+                title="Spike Minute Heatmap - Average Across Runs (clean)",
+                out_path=group_plots / "spike_heatmap_average_clean.png",
+            )
 
-        # Min/Max spike minute across runs (raw)
-        min_spike: Dict[Tuple[int, int], float] = {}
-        max_spike: Dict[Tuple[int, int], float] = {}
-        for pair in sorted(all_spike_pairs):
-            vals = [m[pair] for m in per_run_spike.values() if pair in m]
-            if vals:
-                min_spike[pair] = float(np.min(vals))
-                max_spike[pair] = float(np.max(vals))
-        smatrix_min, sinputs_min, soutputs_min = build_matrix(min_spike)
-        plot_heatmap(
-            smatrix_min,
-            sinputs_min,
-            soutputs_min,
-            title="Spike Minute Heatmap - Min Across Runs",
-            out_path=plots_base / "spike_heatmap_min.png",
-        )
-        smatrix_max, sinputs_max, soutputs_max = build_matrix(max_spike)
-        plot_heatmap(
-            smatrix_max,
-            sinputs_max,
-            soutputs_max,
-            title="Spike Minute Heatmap - Max Across Runs",
-            out_path=plots_base / "spike_heatmap_max.png",
-        )
+            # Min/Max spike minute across runs (raw)
+            min_spike: Dict[Tuple[int, int], float] = {}
+            max_spike: Dict[Tuple[int, int], float] = {}
+            for pair in sorted(all_spike_pairs):
+                vals = [m[pair] for m in per_run_spike.values() if pair in m]
+                if vals:
+                    min_spike[pair] = float(np.min(vals))
+                    max_spike[pair] = float(np.max(vals))
+            smatrix_min, sinputs_min, soutputs_min = build_matrix(min_spike)
+            plot_heatmap(
+                smatrix_min,
+                sinputs_min,
+                soutputs_min,
+                title="Spike Minute Heatmap - Min Across Runs",
+                out_path=group_plots / "spike_heatmap_min.png",
+            )
+            smatrix_max, sinputs_max, soutputs_max = build_matrix(max_spike)
+            plot_heatmap(
+                smatrix_max,
+                sinputs_max,
+                soutputs_max,
+                title="Spike Minute Heatmap - Max Across Runs",
+                out_path=group_plots / "spike_heatmap_max.png",
+            )
 
-        # Min/Max spike minute across runs (clean)
-        min_spike_c: Dict[Tuple[int, int], float] = {}
-        max_spike_c: Dict[Tuple[int, int], float] = {}
-        for pair in sorted(all_spike_pairs):
-            vals_c = [m[pair] for run_name, m in per_run_spike.items() if pair in m and (run_name, pair) not in flagged]
-            if vals_c:
-                min_spike_c[pair] = float(np.min(vals_c))
-                max_spike_c[pair] = float(np.max(vals_c))
-        smatrix_min_c, sinputs_min_c, soutputs_min_c = build_matrix(min_spike_c)
-        plot_heatmap(
-            smatrix_min_c,
-            sinputs_min_c,
-            soutputs_min_c,
-            title="Spike Minute Heatmap - Min Across Runs (clean)",
-            out_path=plots_base / "spike_heatmap_min_clean.png",
-        )
-        smatrix_max_c, sinputs_max_c, soutputs_max_c = build_matrix(max_spike_c)
-        plot_heatmap(
-            smatrix_max_c,
-            sinputs_max_c,
-            soutputs_max_c,
-            title="Spike Minute Heatmap - Max Across Runs (clean)",
-            out_path=plots_base / "spike_heatmap_max_clean.png",
-        )
-    else:
-        print("No failing iterations found for spike minute heatmaps.")
+            # Min/Max spike minute across runs (clean)
+            min_spike_c: Dict[Tuple[int, int], float] = {}
+            max_spike_c: Dict[Tuple[int, int], float] = {}
+            for pair in sorted(all_spike_pairs):
+                vals_c = [m[pair] for run_name, m in per_run_spike.items() if pair in m and (run_name, pair) not in flagged]
+                if vals_c:
+                    min_spike_c[pair] = float(np.min(vals_c))
+                    max_spike_c[pair] = float(np.max(vals_c))
+            smatrix_min_c, sinputs_min_c, soutputs_min_c = build_matrix(min_spike_c)
+            plot_heatmap(
+                smatrix_min_c,
+                sinputs_min_c,
+                soutputs_min_c,
+                title="Spike Minute Heatmap - Min Across Runs (clean)",
+                out_path=group_plots / "spike_heatmap_min_clean.png",
+            )
+            smatrix_max_c, sinputs_max_c, soutputs_max_c = build_matrix(max_spike_c)
+            plot_heatmap(
+                smatrix_max_c,
+                sinputs_max_c,
+                soutputs_max_c,
+                title="Spike Minute Heatmap - Max Across Runs (clean)",
+                out_path=group_plots / "spike_heatmap_max_clean.png",
+            )
+        else:
+            print("No failing iterations found for spike minute heatmaps in group '", group_name, "'.")
 
     # -----------------------------------------------------
     # Avg response time heatmaps for MST iterations (True)
     # -----------------------------------------------------
     print("Computing average response time heatmaps for MST iterations...")
-    per_run_mst_dirs: Dict[str, Dict[Tuple[int, int], Path]] = {}
-    per_run_avg_rt: Dict[str, Dict[Tuple[int, int], float]] = {}
-    for run_root in sorted(run_roots, key=lambda p: p.name):
-        run_name = run_root.name
-        mst_dirs = collect_mst_iteration_dirs_for_run(run_root)
-        per_run_mst_dirs[run_name] = mst_dirs
-        avg_map: Dict[Tuple[int, int], float] = {}
-        for pair, ts_dir in mst_dirs.items():
-            avg_rt = compute_avg_response_time_for_iteration(ts_dir)
-            if avg_rt is not None:
-                avg_map[pair] = avg_rt
-        per_run_avg_rt[run_name] = avg_map
+    run_roots = discover_run_dirs(data_base)
+    groups = group_run_roots_by_top_level(run_roots, data_base)
+
+    for group_name, group_runs in sorted(groups.items(), key=lambda x: x[0]):
+        group_plots = plots_base / group_name
+        per_run_mst_dirs: Dict[str, Dict[Tuple[int, int], Path]] = {}
+        per_run_avg_rt: Dict[str, Dict[Tuple[int, int], float]] = {}
+        flagged: set = set()
+        for run_root in sorted(group_runs, key=lambda p: p.as_posix()):
+            run_name = run_root.name
+            mst_dirs = collect_mst_iteration_dirs_for_run(run_root)
+            per_run_mst_dirs[run_name] = mst_dirs
+            avg_map: Dict[Tuple[int, int], float] = {}
+            for pair, ts_dir in mst_dirs.items():
+                avg_rt = compute_avg_response_time_for_iteration(ts_dir)
+                if avg_rt is not None:
+                    avg_map[pair] = avg_rt
+            per_run_avg_rt[run_name] = avg_map
 
         # Save per-run avg RT CSV
         if avg_map:
-            out_csv = plots_base / f"avg_rt_mst_{run_name}.csv"
+            out_csv = group_plots / f"avg_rt_mst_{run_name}.csv"
             with out_csv.open('w', newline='', encoding='utf-8') as f:
                 w = csv.writer(f)
                 w.writerow(["input_tokens", "output_tokens", "avg_response_time_ms"])
@@ -951,7 +1044,7 @@ def main(
             rinputs,
             routputs,
             title=f"Avg Response Time (ms) - {run_name} MST",
-            out_path=plots_base / f"avg_rt_mst_heatmap_{run_name}.png",
+            out_path=group_plots / f"avg_rt_mst_heatmap_{run_name}.png",
         )
 
         # Plot per-run avg RT heatmap (clean): exclude flagged
@@ -962,122 +1055,125 @@ def main(
             rinputs_c,
             routputs_c,
             title=f"Avg Response Time (ms) - {run_name} MST (clean)",
-            out_path=plots_base / f"avg_rt_mst_heatmap_{run_name}_clean.png",
+            out_path=group_plots / f"avg_rt_mst_heatmap_{run_name}_clean.png",
         )
 
-    # Average across runs (raw)
-    all_pairs_rt = set()
-    for m in per_run_avg_rt.values():
-        all_pairs_rt.update(m.keys())
+        # Average across runs (raw)
+        all_pairs_rt = set()
+        for m in per_run_avg_rt.values():
+            all_pairs_rt.update(m.keys())
 
-    if all_pairs_rt:
-        avg_rt_over_runs: Dict[Tuple[int, int], float] = {}
-        for pair in sorted(all_pairs_rt):
-            vals = [m[pair] for m in per_run_avg_rt.values() if pair in m]
-            if vals:
-                avg_rt_over_runs[pair] = float(np.mean(vals))
-        hmat, hinputs, houtputs = build_matrix(avg_rt_over_runs)
-        plot_heatmap(
-            hmat,
-            hinputs,
-            houtputs,
-            title="Avg Response Time (ms) - Average Across Runs (MST)",
-            out_path=plots_base / "avg_rt_mst_heatmap_average.png",
-        )
+        if all_pairs_rt:
+            avg_rt_over_runs: Dict[Tuple[int, int], float] = {}
+            for pair in sorted(all_pairs_rt):
+                vals = [m[pair] for m in per_run_avg_rt.values() if pair in m]
+                if vals:
+                    avg_rt_over_runs[pair] = float(np.mean(vals))
+            hmat, hinputs, houtputs = build_matrix(avg_rt_over_runs)
+            plot_heatmap(
+                hmat,
+                hinputs,
+                houtputs,
+                title=f"Avg Response Time (ms) - Average Across Runs (MST, {group_title(group_name)})",
+                out_path=group_plots / "avg_rt_mst_heatmap_average.png",
+            )
 
-        # Average across runs (clean)
-        avg_rt_over_runs_clean: Dict[Tuple[int, int], float] = {}
-        for pair in sorted(all_pairs_rt):
-            vals_c = [m[pair] for run_name, m in per_run_avg_rt.items() if pair in m and (run_name, pair) not in flagged]
-            if vals_c:
-                avg_rt_over_runs_clean[pair] = float(np.mean(vals_c))
-        hmat_c, hinputs_c, houtputs_c = build_matrix(avg_rt_over_runs_clean)
-        plot_heatmap(
-            hmat_c,
-            hinputs_c,
-            houtputs_c,
-            title="Avg Response Time (ms) - Average Across Runs (MST, clean)",
-            out_path=plots_base / "avg_rt_mst_heatmap_average_clean.png",
-        )
+            # Average across runs (clean)
+            avg_rt_over_runs_clean: Dict[Tuple[int, int], float] = {}
+            for pair in sorted(all_pairs_rt):
+                vals_c = [m[pair] for run_name, m in per_run_avg_rt.items() if pair in m and (run_name, pair) not in flagged]
+                if vals_c:
+                    avg_rt_over_runs_clean[pair] = float(np.mean(vals_c))
+            hmat_c, hinputs_c, houtputs_c = build_matrix(avg_rt_over_runs_clean)
+            plot_heatmap(
+                hmat_c,
+                hinputs_c,
+                houtputs_c,
+                title=f"Avg Response Time (ms) - Average Across Runs (MST, clean, {group_title(group_name)})",
+                out_path=group_plots / "avg_rt_mst_heatmap_average_clean.png",
+            )
 
-        # Min/Max across runs (raw)
-        min_rt_map: Dict[Tuple[int, int], float] = {}
-        max_rt_map: Dict[Tuple[int, int], float] = {}
-        for pair in sorted(all_pairs_rt):
-            vals = [m[pair] for m in per_run_avg_rt.values() if pair in m]
-            if vals:
-                min_rt_map[pair] = float(np.min(vals))
-                max_rt_map[pair] = float(np.max(vals))
-        mmat, minputs, moutputs = build_matrix(min_rt_map)
-        plot_heatmap(
-            mmat,
-            minputs,
-            moutputs,
-            title="Avg Response Time (ms) - Min Across Runs (MST)",
-            out_path=plots_base / "avg_rt_mst_heatmap_min.png",
-        )
-        xmat, xinputs, xoutputs = build_matrix(max_rt_map)
-        plot_heatmap(
-            xmat,
-            xinputs,
-            xoutputs,
-            title="Avg Response Time (ms) - Max Across Runs (MST)",
-            out_path=plots_base / "avg_rt_mst_heatmap_max.png",
-        )
+            # Min/Max across runs (raw)
+            min_rt_map: Dict[Tuple[int, int], float] = {}
+            max_rt_map: Dict[Tuple[int, int], float] = {}
+            for pair in sorted(all_pairs_rt):
+                vals = [m[pair] for m in per_run_avg_rt.values() if pair in m]
+                if vals:
+                    min_rt_map[pair] = float(np.min(vals))
+                    max_rt_map[pair] = float(np.max(vals))
+            mmat, minputs, moutputs = build_matrix(min_rt_map)
+            plot_heatmap(
+                mmat,
+                minputs,
+                moutputs,
+                title=f"Avg Response Time (ms) - Min Across Runs (MST, {group_title(group_name)})",
+                out_path=group_plots / "avg_rt_mst_heatmap_min.png",
+            )
+            xmat, xinputs, xoutputs = build_matrix(max_rt_map)
+            plot_heatmap(
+                xmat,
+                xinputs,
+                xoutputs,
+                title=f"Avg Response Time (ms) - Max Across Runs (MST, {group_title(group_name)})",
+                out_path=group_plots / "avg_rt_mst_heatmap_max.png",
+            )
 
-        # Min/Max across runs (clean)
-        min_rt_map_c: Dict[Tuple[int, int], float] = {}
-        max_rt_map_c: Dict[Tuple[int, int], float] = {}
-        for pair in sorted(all_pairs_rt):
-            vals_c = [m[pair] for run_name, m in per_run_avg_rt.items() if pair in m and (run_name, pair) not in flagged]
-            if vals_c:
-                min_rt_map_c[pair] = float(np.min(vals_c))
-                max_rt_map_c[pair] = float(np.max(vals_c))
-        mmat_c, minputs_c, moutputs_c = build_matrix(min_rt_map_c)
-        plot_heatmap(
-            mmat_c,
-            minputs_c,
-            moutputs_c,
-            title="Avg Response Time (ms) - Min Across Runs (MST, clean)",
-            out_path=plots_base / "avg_rt_mst_heatmap_min_clean.png",
-        )
-        xmat_c, xinputs_c, xoutputs_c = build_matrix(max_rt_map_c)
-        plot_heatmap(
-            xmat_c,
-            xinputs_c,
-            xoutputs_c,
-            title="Avg Response Time (ms) - Max Across Runs (MST, clean)",
-            out_path=plots_base / "avg_rt_mst_heatmap_max_clean.png",
-        )
-    else:
-        print("No MST iterations found with response time data.")
+            # Min/Max across runs (clean)
+            min_rt_map_c: Dict[Tuple[int, int], float] = {}
+            max_rt_map_c: Dict[Tuple[int, int], float] = {}
+            for pair in sorted(all_pairs_rt):
+                vals_c = [m[pair] for run_name, m in per_run_avg_rt.items() if pair in m and (run_name, pair) not in flagged]
+                if vals_c:
+                    min_rt_map_c[pair] = float(np.min(vals_c))
+                    max_rt_map_c[pair] = float(np.max(vals_c))
+            mmat_c, minputs_c, moutputs_c = build_matrix(min_rt_map_c)
+            plot_heatmap(
+                mmat_c,
+                minputs_c,
+                moutputs_c,
+                title=f"Avg Response Time (ms) - Min Across Runs (MST, clean, {group_title(group_name)})",
+                out_path=group_plots / "avg_rt_mst_heatmap_min_clean.png",
+            )
+            xmat_c, xinputs_c, xoutputs_c = build_matrix(max_rt_map_c)
+            plot_heatmap(
+                xmat_c,
+                xinputs_c,
+                xoutputs_c,
+                title=f"Avg Response Time (ms) - Max Across Runs (MST, clean, {group_title(group_name)})",
+                out_path=group_plots / "avg_rt_mst_heatmap_max_clean.png",
+            )
+        else:
+            print(f"No MST iterations found with response time data in group '{group_name}'.")
 
     # -----------------------------------------------------------
     # Response count heatmaps for MST iterations (row counts)
     # -----------------------------------------------------------
     print("Computing responses-per-minute heatmaps for MST iterations...")
     # Reuse per_run_mst_dirs if available; otherwise, rebuild
-    try:
-        per_run_mst_dirs
-    except NameError:
-        per_run_mst_dirs = {}
-        for run_root in sorted(run_roots, key=lambda p: p.name):
+    run_roots = discover_run_dirs(data_base)
+    groups = group_run_roots_by_top_level(run_roots, data_base)
+
+    for group_name, group_runs in sorted(groups.items(), key=lambda x: x[0]):
+        group_plots = plots_base / group_name
+        per_run_mst_dirs: Dict[str, Dict[Tuple[int, int], Path]] = {}
+        for run_root in sorted(group_runs, key=lambda p: p.as_posix()):
             per_run_mst_dirs[run_root.name] = collect_mst_iteration_dirs_for_run(run_root)
 
-    per_run_resp_count: Dict[str, Dict[Tuple[int, int], float]] = {}
-    for run_root in sorted(run_roots, key=lambda p: p.name):
-        run_name = run_root.name
-        mst_dirs = per_run_mst_dirs.get(run_name, {})
-        cnt_map: Dict[Tuple[int, int], float] = {}
-        for pair, ts_dir in mst_dirs.items():
-            rpm = compute_response_rate_per_min_for_iteration(ts_dir)
-            if rpm is not None:
-                cnt_map[pair] = rpm
-        per_run_resp_count[run_name] = cnt_map
+        per_run_resp_count: Dict[str, Dict[Tuple[int, int], float]] = {}
+        flagged: set = set()
+        for run_root in sorted(group_runs, key=lambda p: p.as_posix()):
+            run_name = run_root.name
+            mst_dirs = per_run_mst_dirs.get(run_name, {})
+            cnt_map: Dict[Tuple[int, int], float] = {}
+            for pair, ts_dir in mst_dirs.items():
+                rpm = compute_response_rate_per_min_for_iteration(ts_dir)
+                if rpm is not None:
+                    cnt_map[pair] = rpm
+            per_run_resp_count[run_name] = cnt_map
 
         # Save per-run response count CSV
         if cnt_map:
-            out_csv = plots_base / f"resp_count_mst_{run_name}.csv"
+            out_csv = group_plots / f"resp_count_mst_{run_name}.csv"
             with out_csv.open('w', newline='', encoding='utf-8') as f:
                 w = csv.writer(f)
                 w.writerow(["input_tokens", "output_tokens", "responses_per_minute"])
@@ -1091,7 +1187,7 @@ def main(
             cinp,
             cout,
             title=f"Responses per Minute - {run_name} MST",
-            out_path=plots_base / f"resp_count_mst_heatmap_{run_name}.png",
+            out_path=group_plots / f"resp_count_mst_heatmap_{run_name}.png",
             cbar_label="Responses/min",
         )
 
@@ -1103,57 +1199,57 @@ def main(
             cinp_c,
             cout_c,
             title=f"Responses per Minute - {run_name} MST (clean)",
-            out_path=plots_base / f"resp_count_mst_heatmap_{run_name}_clean.png",
+            out_path=group_plots / f"resp_count_mst_heatmap_{run_name}_clean.png",
             cbar_label="Responses/min",
         )
 
-    # Average response count across runs (raw)
-    all_pairs_cnt = set()
-    for m in per_run_resp_count.values():
-        all_pairs_cnt.update(m.keys())
+        # Average response count across runs (raw)
+        all_pairs_cnt = set()
+        for m in per_run_resp_count.values():
+            all_pairs_cnt.update(m.keys())
 
-    if all_pairs_cnt:
-        avg_cnt_over_runs: Dict[Tuple[int, int], float] = {}
-        for pair in sorted(all_pairs_cnt):
-            vals = [m[pair] for m in per_run_resp_count.values() if pair in m]
-            if vals:
-                avg_cnt_over_runs[pair] = float(np.mean(vals))
+        if all_pairs_cnt:
+            avg_cnt_over_runs: Dict[Tuple[int, int], float] = {}
+            for pair in sorted(all_pairs_cnt):
+                vals = [m[pair] for m in per_run_resp_count.values() if pair in m]
+                if vals:
+                    avg_cnt_over_runs[pair] = float(np.mean(vals))
 
-        # Save average CSV
-        out_avg_csv = plots_base / "resp_count_mst_average.csv"
-        with out_avg_csv.open('w', newline='', encoding='utf-8') as f:
-            w = csv.writer(f)
-            w.writerow(["input_tokens", "output_tokens", "avg_responses_per_minute"])
-            for (inp, outp), val in sorted(avg_cnt_over_runs.items()):
-                w.writerow([inp, outp, val])
+            # Save average CSV
+            out_avg_csv = group_plots / "resp_count_mst_average.csv"
+            with out_avg_csv.open('w', newline='', encoding='utf-8') as f:
+                w = csv.writer(f)
+                w.writerow(["input_tokens", "output_tokens", "avg_responses_per_minute"])
+                for (inp, outp), val in sorted(avg_cnt_over_runs.items()):
+                    w.writerow([inp, outp, val])
 
-        hcmat, hcinp, hcout = build_matrix(avg_cnt_over_runs)
-        plot_heatmap(
-            hcmat,
-            hcinp,
-            hcout,
-            title="Responses per Minute - Average Across Runs (MST)",
-            out_path=plots_base / "resp_count_mst_heatmap_average.png",
-            cbar_label="Responses/min",
-        )
+            hcmat, hcinp, hcout = build_matrix(avg_cnt_over_runs)
+            plot_heatmap(
+                hcmat,
+                hcinp,
+                hcout,
+                title=f"Responses per Minute - Average Across Runs (MST, {group_title(group_name)})",
+                out_path=group_plots / "resp_count_mst_heatmap_average.png",
+                cbar_label="Responses/min",
+            )
 
-        # Average across runs (clean)
-        avg_cnt_over_runs_clean: Dict[Tuple[int, int], float] = {}
-        for pair in sorted(all_pairs_cnt):
-            vals_c = [m[pair] for run_name, m in per_run_resp_count.items() if pair in m and (run_name, pair) not in flagged]
-            if vals_c:
-                avg_cnt_over_runs_clean[pair] = float(np.mean(vals_c))
-        hcmat_c, hcinp_c, hcout_c = build_matrix(avg_cnt_over_runs_clean)
-        plot_heatmap(
-            hcmat_c,
-            hcinp_c,
-            hcout_c,
-            title="Responses per Minute - Average Across Runs (MST, clean)",
-            out_path=plots_base / "resp_count_mst_heatmap_average_clean.png",
-            cbar_label="Responses/min",
-        )
-    else:
-        print("No MST iterations found with response count data.")
+            # Average across runs (clean)
+            avg_cnt_over_runs_clean: Dict[Tuple[int, int], float] = {}
+            for pair in sorted(all_pairs_cnt):
+                vals_c = [m[pair] for run_name, m in per_run_resp_count.items() if pair in m and (run_name, pair) not in flagged]
+                if vals_c:
+                    avg_cnt_over_runs_clean[pair] = float(np.mean(vals_c))
+            hcmat_c, hcinp_c, hcout_c = build_matrix(avg_cnt_over_runs_clean)
+            plot_heatmap(
+                hcmat_c,
+                hcinp_c,
+                hcout_c,
+                title=f"Responses per Minute - Average Across Runs (MST, clean, {group_title(group_name)})",
+                out_path=group_plots / "resp_count_mst_heatmap_average_clean.png",
+                cbar_label="Responses/min",
+            )
+        else:
+            print(f"No MST iterations found with response count data in group '{group_name}'.")
 
 
 if __name__ == "__main__":
