@@ -248,24 +248,26 @@ def plot_heatmap(matrix: np.ndarray, inputs: List[int], outputs: List[int], titl
         print(f"Skipping plot for {title}: no data")
         return
 
-    # Reverse rows so that smaller output tokens are at the bottom
-    matrix_plot = matrix[::-1, :]
-    outputs_plot = outputs[::-1]
+    # Transpose so columns = output tokens (X-axis), rows = input tokens (Y-axis)
+    matrix_t = matrix.T
+    # Reverse rows so that smaller input tokens are at the bottom
+    matrix_plot = matrix_t[::-1, :]
+    inputs_plot = inputs[::-1]
 
-    plt.figure(figsize=(max(6, len(inputs) * 0.8), max(5, len(outputs) * 0.6)))
+    plt.figure(figsize=(max(6, len(outputs) * 0.8), max(5, len(inputs) * 0.6)))
     sns.heatmap(
         matrix_plot,
         annot=True,
         fmt=".1f",
         cmap="YlGnBu",
-        xticklabels=inputs,
-        yticklabels=outputs_plot,
+        xticklabels=outputs,
+        yticklabels=inputs_plot,
         linewidths=0.5,
         linecolor='white',
         cbar_kws={"label": cbar_label}
     )
-    plt.xlabel("Input tokens")
-    plt.ylabel("Output tokens")
+    plt.xlabel("Output tokens")
+    plt.ylabel("Input tokens")
     plt.title(title)
     plt.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
