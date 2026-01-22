@@ -254,21 +254,41 @@ def plot_heatmap(matrix: np.ndarray, inputs: List[int], outputs: List[int], titl
     matrix_plot = matrix_t[::-1, :]
     inputs_plot = inputs[::-1]
 
+    # Font sizes for readability
+    annot_fontsize = 13
+    tick_label_fontsize = 13  # increase axis tick values
+    cbar_label_fontsize = 13
+    cbar_tick_fontsize = 13
+
     plt.figure(figsize=(max(6, len(outputs) * 0.8), max(5, len(inputs) * 0.6)))
-    sns.heatmap(
+    ax = sns.heatmap(
         matrix_plot,
         annot=True,
-        fmt=".1f",
+        fmt=".0f",  # round annotations to integers for space and readability
         cmap="YlGnBu",
         xticklabels=outputs,
         yticklabels=inputs_plot,
         linewidths=0.5,
         linecolor='white',
-        cbar_kws={"label": cbar_label}
+        cbar_kws={"label": cbar_label},
+        annot_kws={"size": annot_fontsize}
     )
-    plt.xlabel("Output tokens")
-    plt.ylabel("Input tokens")
-    plt.title(title)
+
+    # Axis names back to previous (default) size; only enlarge tick labels
+    ax.set_xlabel("Output tokens", fontsize=13)
+    ax.set_ylabel("Input tokens", fontsize=13)
+    ax.tick_params(axis='both', labelsize=tick_label_fontsize)
+
+    # Enlarge colorbar labels and ticks
+    if ax.collections and hasattr(ax.collections[0], 'colorbar'):
+        cbar = ax.collections[0].colorbar
+        if cbar is not None:
+            cbar.ax.yaxis.label.set_size(cbar_label_fontsize)
+            cbar.ax.tick_params(labelsize=cbar_tick_fontsize)
+
+    # Remove the plot title as requested (keep parameter for compatibility)
+    # (Intentionally not setting a title)
+
     plt.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=200)
