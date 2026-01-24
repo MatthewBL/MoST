@@ -1,5 +1,6 @@
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
 from pathlib import Path
 from typing import Dict, List
 
@@ -71,6 +72,18 @@ def aggregate_by_tokens(df: pd.DataFrame) -> (pd.DataFrame, pd.DataFrame):
     return avg_by_input, avg_by_output
 
 
+def _thousands_to_k(x, pos=None):
+    val = abs(x)
+    if val >= 1000:
+        k = x / 1000.0
+        s = f"{k:.1f}".rstrip("0").rstrip(".")
+        return f"{s}k"
+    # show integers cleanly, otherwise minimal float
+    if abs(x - round(x)) < 1e-6:
+        return f"{int(round(x))}"
+    return f"{x:g}"
+
+
 def plot_faceted_lines(
     avg_by_input: pd.DataFrame,
     avg_by_output: pd.DataFrame,
@@ -89,13 +102,23 @@ def plot_faceted_lines(
     for exp in experiments:
         sub = avg_by_input[avg_by_input["experiment"] == exp]
         label = GROUP_TITLE_MAP.get(exp, exp)
-        ax1.plot(sub["input_tokens"], sub["avg_mst"], marker="o", label=label)
-    ax1.set_title("Average MST by Input Tokens")
-    ax1.set_xlabel("Input Tokens")
-    ax1.set_ylabel("Average MST (req/min)")
+        ax1.plot(
+            sub["input_tokens"],
+            sub["avg_mst"],
+            marker="o",
+            markersize=8,
+            linewidth=2,
+            label=label,
+        )
+    ax1.set_title("Average MST by Input Tokens", fontsize=16)
+    ax1.set_xlabel("Input Tokens", fontsize=14)
+    ax1.set_ylabel("Average MST (req/min)", fontsize=14)
     ax1.grid(True, alpha=0.3)
-    ax1.set_ylim(bottom=0)
-    ax1.legend(loc="upper right", frameon=False)
+    ax1.set_ylim(bottom=0,top=6000)
+    ax1.xaxis.set_major_formatter(FuncFormatter(_thousands_to_k))
+    ax1.yaxis.set_major_formatter(FuncFormatter(_thousands_to_k))
+    ax1.tick_params(axis="both", labelsize=16)
+    ax1.legend(loc="upper right", frameon=False, fontsize=14)
     out_path_input.parent.mkdir(parents=True, exist_ok=True)
     fig1.tight_layout()
     fig1.savefig(out_path_input, dpi=200)
@@ -109,13 +132,23 @@ def plot_faceted_lines(
     for exp in experiments_out:
         sub = avg_by_output[avg_by_output["experiment"] == exp]
         label = GROUP_TITLE_MAP.get(exp, exp)
-        ax2.plot(sub["output_tokens"], sub["avg_mst"], marker="o", label=label)
-    ax2.set_title("Average MST by Output Tokens")
-    ax2.set_xlabel("Output Tokens")
-    ax2.set_ylabel("Average MST (req/min)")
+        ax2.plot(
+            sub["output_tokens"],
+            sub["avg_mst"],
+            marker="o",
+            markersize=8,
+            linewidth=2,
+            label=label,
+        )
+    ax2.set_title("Average MST by Output Tokens", fontsize=16)
+    ax2.set_xlabel("Output Tokens", fontsize=14)
+    ax2.set_ylabel("Average MST (req/min)", fontsize=14)
     ax2.grid(True, alpha=0.3)
-    ax2.set_ylim(bottom=0)
-    ax2.legend(loc="upper right", frameon=False)
+    ax2.set_ylim(bottom=0,top=6000)
+    ax2.xaxis.set_major_formatter(FuncFormatter(_thousands_to_k))
+    ax2.yaxis.set_major_formatter(FuncFormatter(_thousands_to_k))
+    ax2.tick_params(axis="both", labelsize=16)
+    ax2.legend(loc="upper right", frameon=False, fontsize=14)
     out_path_output.parent.mkdir(parents=True, exist_ok=True)
     fig2.tight_layout()
     fig2.savefig(out_path_output, dpi=200)
