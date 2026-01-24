@@ -243,7 +243,7 @@ def build_matrix(mst_map: Dict[Tuple[int, int], float]) -> Tuple[np.ndarray, Lis
     return mat, inputs, outputs
 
 
-def plot_heatmap(matrix: np.ndarray, inputs: List[int], outputs: List[int], title: str, out_path: Path, cbar_label: str = "MST (req/min)") -> None:
+def plot_heatmap(matrix: np.ndarray, inputs: List[int], outputs: List[int], title: str, out_path: Path, cbar_label: str = "MST (resp/min)") -> None:
     if matrix.size == 0:
         print(f"Skipping plot for {title}: no data")
         return

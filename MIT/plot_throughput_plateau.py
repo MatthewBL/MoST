@@ -167,18 +167,18 @@ def plot_per_input(in_tokens, series_map, base_title, out_path):
             label = f"out={y}"
         except Exception:
             label = tokens_dir
-        plt.plot(xs, ys, marker='o', linewidth=2, label=label)
+        line, = plt.plot(xs, ys, marker='o', linewidth=2, label=label)
 
     # Bigger text for labels and ticks (keep title default size)
-    plt.xlabel('Concurrent requests', fontsize=16)
-    plt.ylabel('Throughput (tokens/sec)', fontsize=16)
-    ax.tick_params(axis='both', which='major', labelsize=14)
+    plt.xlabel('Concurrent requests', fontsize=20)
+    plt.ylabel('Throughput (tokens/sec)', fontsize=20)
+    ax.tick_params(axis='both', which='major', labelsize=18)
 
     # Format thousands as k on the Y axis (throughput)
     ax.yaxis.set_major_formatter(FuncFormatter(_format_k))
-    plt.title(f"{base_title} — input tokens: {in_tokens}", fontsize=16)
+    plt.title(f"{base_title} — input tokens: {in_tokens}", fontsize=20)
     plt.grid(True, linestyle='--', alpha=0.4)
-    plt.legend(ncol=3, fontsize=14, title='Output tokens', title_fontsize=14)
+    plt.legend(ncol=3, fontsize=18, title='Output tokens', title_fontsize=18)
     plt.tight_layout()
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -188,9 +188,9 @@ def plot_per_input(in_tokens, series_map, base_title, out_path):
 
 def main():
     parser = argparse.ArgumentParser(description='Plot throughput vs load from MIT slurm logs.')
-    parser.add_argument('--base-dir', default=os.path.join('MIT', 'data', 'deepseek 7B - a40'),
+    parser.add_argument('--base-dir', default=os.path.join('MIT', 'data', 'Deepseek 7B - A40'),
                         help='Base directory containing model/gpu results with XXX_YYY folders and slurm logs.')
-    parser.add_argument('--out-dir', default=os.path.join('MIT', 'plots', 'deepseek 7B - a40'),
+    parser.add_argument('--out-dir', default=os.path.join('MIT', 'plots', 'Deepseek 7B - A40'),
                         help='Directory to save per-input plots.')
     args = parser.parse_args()
 
@@ -200,12 +200,12 @@ def main():
         print('No throughput data found. Ensure slurm-*.out logs exist and contain summary tables.')
         return
 
-    base_title = f"Throughput vs Load (u) — {os.path.basename(args.base_dir)}"
+    base_title = f"MIT — {os.path.basename(args.base_dir)}"
     groups = group_by_input(aggregate)
 
     # Save one figure per input token count
     for in_tokens, series_map in sorted(groups.items()):
-        fname = f"throughput_vs_load_{os.path.basename(args.base_dir).replace(' ', '_')}_in_{in_tokens}.png"
+        fname = f"mit_{os.path.basename(args.base_dir).replace(' ', '_')}_in_{in_tokens}.png"
         out_path = os.path.join(args.out_dir, fname)
         plot_per_input(in_tokens, series_map, base_title, out_path)
 
